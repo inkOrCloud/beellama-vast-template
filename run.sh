@@ -308,6 +308,10 @@ else
 fi
 verify_model() {
     [ -f "$MODEL" ] || return 1
+    if [ "${SKIP_VERIFY:-0}" = "1" ]; then
+        echo "SKIP_VERIFY=1 — existence check only (no sha256)"
+        return 0
+    fi
     if [ -n "$expected" ]; then
         actual=$(sha256sum "$MODEL" 2>/dev/null | cut -d' ' -f1)
         [ "$actual" = "$expected" ]
