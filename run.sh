@@ -363,7 +363,13 @@ else
     echo "downloading $HF_REPO/$HF_FILE -> $MODEL_DIR (XET high-performance)..."
     mkdir -p "$MODEL_DIR"
     export HF_HOME="$MODEL_DIR/.hf-cache"
-    hf download "$HF_REPO" "$HF_FILE" --local-dir "$MODEL_DIR" || fail "hf download failed"
+    # XET can hang on hosts with bad connectivity to the XET CAS bridge (seen
+    # 2026-08-10: concurrency controller spiraling down, zero progress). Guard
+    # with timeout; on failure/timeout retry once with XET disabled (plain HTTP).
+    if ! timeout 1500 hf download "$HF_REPO" "$HF_FILE" --local-dir "$MODEL_DIR"; then
+        echo "XET download failed or timed out — retrying with HF_HUB_DISABLE_XET=1 (plain HTTP)..."
+        HF_HUB_DISABLE_XET=1 timeout 1500 hf download "$HF_REPO" "$HF_FILE" --local-dir "$MODEL_DIR" || fail "hf download failed (XET and plain HTTP)"
+    fi
     verify_model || { rm -f "$MODEL"; fail "sha256 verification FAILED after download"; }
 fi
 ls -la "$MODEL"
