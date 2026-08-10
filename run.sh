@@ -50,6 +50,11 @@ CF_LOG="$WORK/cf.log"
 SRC="$WORK/beellama.cpp"
 BUILD="$WORK/build"
 REPO_URL=https://github.com/Anbeeld/beellama.cpp
+# Prebuilt image (ghcr.io/inkorcloud/beellama-cuda): llama-server already at
+# /app, python3 + hf + cloudflared baked in -> skip ALL toolchain installs and
+# compilation. Fresh instances then start in seconds instead of ~30+ min.
+PREBUILT=0
+[ -x /app/llama-server ] && PREBUILT=1
 
 export PATH="/opt/conda/bin:/usr/local/bin:/root/.local/bin:$PATH"
 export DEBIAN_FRONTEND=noninteractive
@@ -212,29 +217,33 @@ echo "portal started on port $PORTAL_PORT (pid $!)"
 
 # ============================================================================
 phase bootstrap
-echo "--- apt packages ---"
-apt-get update -qq || true
-apt-get install -y -qq --no-install-recommends build-essential cmake git curl ca-certificates psmisc || fail "apt install failed"
-if ! command -v nvcc >/dev/null 2>&1; then
-    echo "nvcc missing -> conda install cuda-toolkit (this can take several minutes)"
-    /opt/conda/bin/conda install -y -q -c nvidia cuda-toolkit=12.4.1 || fail "conda cuda-toolkit install failed"
-fi
-# conda's cuda-toolkit metapackage can omit cuBLAS dev headers (seen 2026-08-08:
-# cublas_v2.h missing -> build fails) — install explicitly, idempotent
-if [ ! -f /opt/conda/include/cublas_v2.h ]; then
-    echo "cublas_v2.h missing -> conda install cuda-cublas-dev"
-    /opt/conda/bin/conda install -y -q -c nvidia cuda-cublas-dev || fail "conda cuda-cublas-dev install failed"
-fi
-nvcc --version | tail -1 || fail "nvcc still missing"
-gcc --version | head -1
-# conda base ships an old libstdc++ (6.0.29, no GLIBCXX_3.4.30); binaries built
-# with system gcc then fail at runtime via RUNPATH /opt/conda/lib (seen 2026-08-08).
-# conda solver is ALSO broken by a stale nvidia cuda-compiler record, so swap the
-# .so directly with the newer system one (backward compatible).
-if [ -f /opt/conda/lib/libstdc++.so.6 ] && ! strings /opt/conda/lib/libstdc++.so.6 2>/dev/null | grep -q "GLIBCXX_3.4.30"; then
-    SYS_LIBCXX=$(ls /usr/lib/x86_64-linux-gnu/libstdc++.so.6.* 2>/dev/null | head -1)
-    if [ -n "$SYS_LIBCXX" ]; then
-        cp -f --remove-destination "$SYS_LIBCXX" /opt/conda/lib/libstdc++.so.6 && echo "conda libstdc++ replaced with $SYS_LIBCXX"
+if [ "$PREBUILT" = 1 ]; then
+    echo "prebuilt image detected (/app/llama-server) — skipping toolchain install (no apt/conda, no compilation)"
+else
+    echo "--- apt packages ---"
+    apt-get update -qq || true
+    apt-get install -y -qq --no-install-recommends build-essential cmake git curl ca-certificates psmisc || fail "apt install failed"
+    if ! command -v nvcc >/dev/null 2>&1; then
+        echo "nvcc missing -> conda install cuda-toolkit (this can take several minutes)"
+        /opt/conda/bin/conda install -y -q -c nvidia cuda-toolkit=12.4.1 || fail "conda cuda-toolkit install failed"
+    fi
+    # conda's cuda-toolkit metapackage can omit cuBLAS dev headers (seen 2026-08-08:
+    # cublas_v2.h missing -> build fails) — install explicitly, idempotent
+    if [ ! -f /opt/conda/include/cublas_v2.h ]; then
+        echo "cublas_v2.h missing -> conda install cuda-cublas-dev"
+        /opt/conda/bin/conda install -y -q -c nvidia cuda-cublas-dev || fail "conda cuda-cublas-dev install failed"
+    fi
+    nvcc --version | tail -1 || fail "nvcc still missing"
+    gcc --version | head -1
+    # conda base ships an old libstdc++ (6.0.29, no GLIBCXX_3.4.30); binaries built
+    # with system gcc then fail at runtime via RUNPATH /opt/conda/lib (seen 2026-08-08).
+    # conda solver is ALSO broken by a stale nvidia cuda-compiler record, so swap the
+    # .so directly with the newer system one (backward compatible).
+    if [ -f /opt/conda/lib/libstdc++.so.6 ] && ! strings /opt/conda/lib/libstdc++.so.6 2>/dev/null | grep -q "GLIBCXX_3.4.30"; then
+        SYS_LIBCXX=$(ls /usr/lib/x86_64-linux-gnu/libstdc++.so.6.* 2>/dev/null | head -1)
+        if [ -n "$SYS_LIBCXX" ]; then
+            cp -f --remove-destination "$SYS_LIBCXX" /opt/conda/lib/libstdc++.so.6 && echo "conda libstdc++ replaced with $SYS_LIBCXX"
+        fi
     fi
 fi
 
@@ -256,29 +265,34 @@ hf version 2>/dev/null | head -1 || true
 
 # ============================================================================
 phase build
-if [ ! -d "$SRC/.git" ]; then
-    echo "cloning $REPO_URL"
-    git clone --depth 1 "$REPO_URL" "$SRC" || fail "git clone failed"
-fi
-if [ ! -x "$BUILD/bin/llama-server" ]; then
-    echo "cmake configure..."
-    # conda nvcc only searches targets/x86_64-linux/include by default; the
-    # nvidia-channel cuda-cublas-dev puts cublas_v2.h in /opt/conda/include
-    # (seen 2026-08-08) -> explicit -I flag
-    CUDA_EXTRA_FLAGS=""
-    [ -f /opt/conda/include/cublas_v2.h ] && CUDA_EXTRA_FLAGS="-I/opt/conda/include"
-    cmake -B "$BUILD" -S "$SRC" -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_CUDA_FLAGS="$CUDA_EXTRA_FLAGS" || fail "cmake configure failed"
-    NCPU=$(nproc); NJ=$(( NCPU > 32 ? 32 : NCPU ))
-    echo "cmake build -j$NJ (KVarN CUDA kernels take a while; plateaus are normal)..."
-    cmake --build "$BUILD" -j"$NJ" --target llama-server || fail "cmake build failed"
-    echo "build done: $(du -sh "$BUILD" 2>/dev/null | cut -f1)"
+if [ "$PREBUILT" = 1 ]; then
+    LLAMA=/app/llama-server
+    echo "using prebuilt llama-server: $LLAMA"
 else
-    echo "build already present, skipping ($BUILD/bin/llama-server)"
+    if [ ! -d "$SRC/.git" ]; then
+        echo "cloning $REPO_URL"
+        git clone --depth 1 "$REPO_URL" "$SRC" || fail "git clone failed"
+    fi
+    if [ ! -x "$BUILD/bin/llama-server" ]; then
+        echo "cmake configure..."
+        # conda nvcc only searches targets/x86_64-linux/include by default; the
+        # nvidia-channel cuda-cublas-dev puts cublas_v2.h in /opt/conda/include
+        # (seen 2026-08-08) -> explicit -I flag
+        CUDA_EXTRA_FLAGS=""
+        [ -f /opt/conda/include/cublas_v2.h ] && CUDA_EXTRA_FLAGS="-I/opt/conda/include"
+        cmake -B "$BUILD" -S "$SRC" -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_FLAGS="$CUDA_EXTRA_FLAGS" || fail "cmake configure failed"
+        NCPU=$(nproc); NJ=$(( NCPU > 32 ? 32 : NCPU ))
+        echo "cmake build -j$NJ (KVarN CUDA kernels take a while; plateaus are normal)..."
+        cmake --build "$BUILD" -j"$NJ" --target llama-server || fail "cmake build failed"
+        echo "build done: $(du -sh "$BUILD" 2>/dev/null | cut -f1)"
+    else
+        echo "build already present, skipping ($BUILD/bin/llama-server)"
+    fi
+    LLAMA="$BUILD/bin/llama-server"
+    [ -x "$LLAMA" ] || LLAMA=$(find "$BUILD" -name llama-server -type f 2>/dev/null | head -1)
+    [ -x "$LLAMA" ] || fail "llama-server binary not found after build"
 fi
-LLAMA="$BUILD/bin/llama-server"
-[ -x "$LLAMA" ] || LLAMA=$(find "$BUILD" -name llama-server -type f 2>/dev/null | head -1)
-[ -x "$LLAMA" ] || fail "llama-server binary not found after build"
 echo "llama-server: $LLAMA"
 "$LLAMA" --version 2>&1 | head -2
 
