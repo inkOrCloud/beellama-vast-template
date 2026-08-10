@@ -1,0 +1,5 @@
+# Secrets / build artifacts — NEVER commit these (contain CF tunnel token)
+register_template.py
+payload.b64
+onstart.txt
+*.log
